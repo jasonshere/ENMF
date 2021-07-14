@@ -15,13 +15,13 @@ def parse_args():
                         help='Interval of evaluation.')
     parser.add_argument('--batch_size', nargs='?', type=int, default=256,
                         help='batch_size')
-    parser.add_argument('--epochs', type=int, default=500,
+    parser.add_argument('--epochs', type=int, default=100,
                         help='Number of epochs.')
     parser.add_argument('--embed_size', type=int, default=64,
                         help='Embedding size.')
     parser.add_argument('--lr', type=float, default=0.05,
                         help='Learning rate.')
-    parser.add_argument('--dropout', type=float, default=0.7,
+    parser.add_argument('--dropout', type=float, default=0.2,
                         help='dropout keep_prob')
     parser.add_argument('--negative_weight', type=float, default=0.5,
                         help='weight of non-observed data')
@@ -34,7 +34,7 @@ def parse_args():
 
 
 def load_data(csv_file):
-    tp = pd.read_csv(csv_file, sep='\t')
+    tp = pd.read_csv(csv_file)
     return tp
 
 
@@ -70,6 +70,9 @@ class ENMF:
         self.iidW = tf.Variable(tf.truncated_normal(shape=[self.item_num + 1, self.embedding_size], mean=0.0,
                                                     stddev=0.01), dtype=tf.float32, name="iidW")
 
+        # self.iidW = tf.Variable(tf.truncated_normal(shape=[self.item_num, self.embedding_size], mean=0.0,
+        #                                             stddev=0.01), dtype=tf.float32, name="iidW")
+
         # item domain
         self.H_i = tf.Variable(tf.constant(0.01, shape=[self.embedding_size, 1]), name="hi")
 
@@ -86,10 +89,17 @@ class ENMF:
         self.pos_r = tf.einsum('ajk,kl->ajl', self.pos_r, self.H_i)
         self.pos_r = tf.reshape(self.pos_r, [-1, max_item_pu])
 
+    def _preall(self):
+        dot = tf.einsum('ac,bc->abc', self.uidW, self.iidW)
+        pre = tf.einsum('ajk,kl->ajl', dot, self.H_i)
+        pre = tf.reshape(pre, [-1, self.item_num + 1])
+        return pre
+
     def _pre(self):
         dot = tf.einsum('ac,bc->abc', self.uid, self.iidW)
         pre = tf.einsum('ajk,kl->ajl', dot, self.H_i)
         pre = tf.reshape(pre, [-1, self.item_num + 1])
+        # pre = tf.reshape(pre, [-1, self.item_num])
         return pre
 
     def _create_loss(self):
@@ -113,6 +123,7 @@ class ENMF:
         self._create_inference()
         self._create_loss()
         self.pre = self._pre()
+        self.preall = self._preall()
 
 
 def train_step1(u_batch, y_batch,args):
@@ -226,7 +237,7 @@ def dev_cold(u_train, i_train, test_set, train_m, test_m):
         print np.mean(recall100[l]), np.mean(ndcg100[l])
 
 
-def dev_step(test_set, train_m, test_m,args):
+def dev_step(train_set, test_set, train_m, test_m,args):
     """
     Evaluates model on a dev set
 
@@ -234,7 +245,10 @@ def dev_step(test_set, train_m, test_m,args):
     user_te = np.array(test_set.keys())
     user_te2 = user_te[:, np.newaxis]
 
-    ll = int(len(user_te) / 128) + 1
+    tra_te = np.array(train_set.keys())[:, np.newaxis]
+
+    # ll = int(len(user_te) / 128) + 1
+    ll = int(len(user_te) / 128)
 
     recall50 = []
     recall100 = []
@@ -259,12 +273,15 @@ def dev_step(test_set, train_m, test_m,args):
         pre = sess.run(
             deep.pre, feed_dict)
 
+        
+
         u_b = user_te[start_index:end_index]
 
         pre = np.array(pre)
+        
         pre = np.delete(pre, -1, axis=1)
-
         idx = np.zeros_like(pre, dtype=bool)
+        
         idx[train_m[u_b].nonzero()] = True
         pre[idx] = -np.inf
 
@@ -317,6 +334,14 @@ def dev_step(test_set, train_m, test_m,args):
         ndcg100.append(ndcg[1])
         ndcg200.append(ndcg[2])
 
+    all_feed_dict = {
+        deep.input_u: tra_te,
+        deep.dropout_keep_prob: 1.0,
+    }
+
+    predictions = np.array(sess.run(deep.preall, all_feed_dict))
+    predictions = np.delete(predictions, -1, axis=1)
+
     recall50 = np.hstack(recall50)
     recall100 = np.hstack(recall100)
     recall200 = np.hstack(recall200)
@@ -327,10 +352,10 @@ def dev_step(test_set, train_m, test_m,args):
     print np.mean(recall50), np.mean(ndcg50)
     print np.mean(recall100), np.mean(ndcg100)
     print np.mean(recall200), np.mean(ndcg200)
-    f1.write(str(np.mean(recall100)) + ' ' + str(np.mean(ndcg100)) + '\n')
-    f1.flush()
+    # f1.write(str(np.mean(recall100)) + ' ' + str(np.mean(ndcg100)) + '\n')
+    # f1.flush()
 
-    return loss
+    return loss, predictions
 
 
 def get_train_instances1(train_set):
@@ -350,19 +375,23 @@ if __name__ == '__main__':
     random_seed = 2019
     args = parse_args()
 
-    if args.dataset == 'ml-1m':
-        print('load ml-1m data')
-        DATA_ROOT = '../data/ml-1m'
-        f1 = open(os.path.join(DATA_ROOT, 'ENMF_user.txt'), 'w')
+    # if args.dataset == 'ml-1m':
+    #     print('load ml-1m data')
+    #     DATA_ROOT = '../data/ml-1m'
+    #     f1 = open(os.path.join(DATA_ROOT, 'ENMF_user.txt'), 'w')
 
-    tp_test = load_data(os.path.join(DATA_ROOT, 'ml.test.txt'))
-    tp_train = load_data(os.path.join(DATA_ROOT, 'ml.train.txt'))
+    fold = 5
+    ds_name = 'Amazon-grocery'
+    DATA_ROOT = "../../drive/MyDrive/recommender_datasets/datasets/{}/" .format(ds_name)
+    PRED_ROOT = "../../drive/MyDrive/recommender_datasets/model_predictions/ENMF/{}/" .format(ds_name)
+    tp_test = load_data(os.path.join(DATA_ROOT, 'test_df_{}.csv'.format(fold)))
+    tp_train = load_data(os.path.join(DATA_ROOT, 'train_df_{}.csv'.format(fold)))
 
     tp_all = tp_train.append(tp_test)
 
     tp_dul = pd.merge(tp_train, tp_test)
 
-    usercount, itemcount = get_count(tp_all, 'uid'), get_count(tp_all, 'sid')
+    usercount, itemcount = get_count(tp_all, 'user'), get_count(tp_all, 'item')
 
     n_users, n_items = usercount.shape[0], itemcount.shape[0]
 
@@ -373,10 +402,10 @@ if __name__ == '__main__':
     embedding_size=args.embed_size
     epochs=args.epochs
 
-    u_train = np.array(tp_train['uid'], dtype=np.int32)
-    i_train = np.array(tp_train['sid'], dtype=np.int32)
-    u_test = np.array(tp_test['uid'], dtype=np.int32)
-    i_test = np.array(tp_test['sid'], dtype=np.int32)
+    u_train = np.array(tp_train['user'], dtype=np.int32)
+    i_train = np.array(tp_train['item'], dtype=np.int32)
+    u_test = np.array(tp_test['user'], dtype=np.int32)
+    i_test = np.array(tp_test['item'], dtype=np.int32)
 
     count = np.ones(len(u_train))
     train_m = scipy.sparse.csr_matrix((count, (u_train, i_train)), dtype=np.int16, shape=(n_users, n_items))
@@ -404,6 +433,8 @@ if __name__ == '__main__':
     for i in train_set:
         while len(train_set[i]) < max_item_pu:
             train_set[i].append(n_items)
+
+    print(len(train_set.keys()))
 
     with tf.Graph().as_default():
         tf.set_random_seed(random_seed)
@@ -449,10 +480,20 @@ if __name__ == '__main__':
 
                 if epoch < epochs:
                     if epoch % args.verbose == 0:
-                        dev_step(test_set, train_m, test_m,args)
+                        _, predictions = dev_step(train_set, test_set, train_m, test_m,args)
 
                 if epoch >= epochs:
-                    dev_step(test_set, train_m, test_m,args)
+                    _, predictions = dev_step(train_set, test_set, train_m, test_m,args)
+    try:
+        os.makedirs("{}/fold-{}".format(PRED_ROOT, fold))
+    except:
+        pass
+    pd.DataFrame(predictions).to_csv("{}/fold-{}/predictions.csv".format(PRED_ROOT, fold), index=False)
+    pd.DataFrame(train_m.toarray()).to_csv("{}/fold-{}/train.csv".format(PRED_ROOT, fold), index=False)
+    pd.DataFrame(test_m.toarray()).to_csv("{}/fold-{}/test.csv".format(PRED_ROOT, fold), index=False)
+
+
+                
 
 
 
